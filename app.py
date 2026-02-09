@@ -603,7 +603,6 @@ if not _RUN_TEST_TIMES:
 
         st.markdown("---")
         location = st.text_input("Farmer location", value="Bihar")
-        preferred_language = st.text_input("Preferred language", value="Hindi")
         current_date = st.text_input("Current date", value="2026-02-09")
 
         # Performance metrics from last run (if available)
@@ -642,8 +641,10 @@ if not _RUN_TEST_TIMES:
             def run_vanilla_thread():
                 try:
                     t0 = time.time()
+                    # Auto-detect language from query
+                    detected_language = detect_language_name(user_question)
                     text = run_vanilla_model(
-                        user_question, location, preferred_language, current_date
+                        user_question, location, detected_language, current_date
                     )
                     perf["vanilla_time"] = time.time() - t0
                     vanilla_result["text"] = text
@@ -768,7 +769,7 @@ if not _RUN_TEST_TIMES:
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "test-times":
     question = "धान की फसल में कीट नियंत्रण कैसे करें?"
-    location, preferred_language, current_date = "Bihar", "Hindi", "2026-02-09"
+    location, current_date = "Bihar", "2026-02-09"
     
     print("=" * 80)
     print("Test times: Vanilla GPT-4o-mini vs Fact+Stitching (FT → Gemma)")
@@ -779,7 +780,9 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "test-times":
     def vanilla_thread():
         t0 = time.time()
         try:
-            run_vanilla_model(question, location, preferred_language, current_date)
+            # Auto-detect language from query
+            detected_language = detect_language_name(question)
+            run_vanilla_model(question, location, detected_language, current_date)
             results["vanilla_time"] = time.time() - t0
         except Exception as e:
             print(f"Vanilla error: {e}")
