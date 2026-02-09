@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import threading
 import json
@@ -26,9 +27,11 @@ TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
 # MODEL CONFIG
 # ============================================================================
 
-VANILLA_MODEL = "gpt-4o-mini-2024-07-18"  # base model
+VANILLA_MODEL = "gpt-4o-mini-2024-07-18"  # left column
 FINE_TUNED_MODEL = "ft:gpt-4o-mini-2024-07-18:dgf-prod-dev-account:3:CafMKPv8"
-SYNTHESIS_MODEL = "google/gemma-3n-E4B-it"
+# Gemma: synthesis model — called ONLY after fine-tuned fact extraction returns
+GEMMA_SYNTHESIS_MODEL = "google/gemma-3n-E4B-it"
+SYNTHESIS_MODEL = GEMMA_SYNTHESIS_MODEL  # alias
 
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
@@ -147,8 +150,8 @@ Where:
 
 COMPARISON_PROMPT = """
 You are an expert agricultural assistant and model evaluator. You will compare TWO answers given to the SAME farmer question:
-- "gpt4o" = vanilla GPT‑4o‑mini answer
-- "ft" = Fine-Tuned + Fact-Stitching answer
+- "Gpt4o-mini" = vanilla GPT‑4o‑mini answer
+- "Fine-Tuned" = Fine-Tuned + Fact-Stitching answer
 
 Your main goal is to highlight where the Fine-Tuned pipeline is **better** along practically useful dimensions, especially:
 - Actionability (clear steps for farmers)
@@ -160,8 +163,8 @@ Your main goal is to highlight where the Fine-Tuned pipeline is **better** along
 Your job:
 1. Mentally break the content into aspects (1–3 sentences or a coherent bullet).
 2. For each aspect, decide which answer serves the farmer better:
-   - "gpt4o" (GPT‑4o‑mini better)
-   - "ft" (Fine-Tuned better)  ← if both are good but ft is slightly better, pick "ft"
+   - "Gpt4o-mini" (GPT‑4o‑mini better)
+   - "Fine-Tuned" (Fine-Tuned better)  ← if both are good but Fine-Tuned is slightly better, pick "Fine-Tuned"
    - "both" (equally good and similar)
    - "neither" (both are poor or irrelevant)
 3. Give a short reason for each aspect-level judgment, focusing on:
@@ -180,9 +183,9 @@ OVERALL|better_model|short_reason
 
 Where:
 - aspect_name is a short name like "actionability", "dosage precision", "timing", "local context", "safety", etc. (no pipes, no newlines)
-- winner is exactly one of: gpt4o, ft, both, neither
+- winner is exactly one of: Gpt4o-mini, Fine-Tuned, both, neither
 - short_reason is a one-line explanation (no newlines, avoid '|' character; use ';' if needed)
-- better_model is exactly one of: gpt4o, ft, both, neither
+- better_model is exactly one of: Gpt4o-mini, Fine-Tuned, both, neither
 """
 
 
@@ -364,6 +367,7 @@ def build_vanilla_system_prompt(
 # ============================================================================
 
 def run_vanilla_model(question: str, location: str, preferred_language: str, current_date: str):
+    """GPT-4o-mini with Farmer.CHAT response-generation prompt."""
     system_prompt = build_vanilla_system_prompt(
         location=location,
         preferred_language=preferred_language,
@@ -388,9 +392,14 @@ def run_vanilla_model(question: str, location: str, preferred_language: str, cur
 
 
 def run_ft_stitched_pipeline(question: str, retry_count: int = 0):
+    """
+    Step 1: Fine-tuned model (fact extraction).
+    Step 2: Gemma (synthesis) — called only after Step 1 returns; uses facts from Step 1.
+    """
     try:
         user_lang = detect_language_name(question)
 
+        # Step 1: Fine-tuned fact extraction (must complete first)
         fact_response = openai.ChatCompletion.create(
             model=FINE_TUNED_MODEL,
             messages=[
@@ -402,6 +411,7 @@ def run_ft_stitched_pipeline(question: str, retry_count: int = 0):
         )
         facts_json_str = fact_response["choices"][0]["message"]["content"]
 
+        # Step 2: Gemma synthesis — only after we have the fine-tuned (fact) response
         synthesis_user_prompt = f"""
 USER QUERY LANGUAGE: {user_lang}
 Preferred Language: {user_lang}
@@ -421,7 +431,7 @@ Preferred Language: {user_lang}
 """
 
         synthesis_response = together_client.chat.completions.create(
-            model=SYNTHESIS_MODEL,
+            model=GEMMA_SYNTHESIS_MODEL,
             messages=[
                 {"role": "system", "content": SYNTHESIS_PROMPT},
                 {"role": "user", "content": synthesis_user_prompt},
@@ -559,184 +569,248 @@ Follow the instructions and JSON schema exactly.
 
 
 # ============================================================================
-# STREAMLIT UI
+# STREAMLIT UI (skip when running: python app.py test-times)
 # ============================================================================
 
-st.set_page_config(page_title="Farmer.CHAT – Model Comparison", layout="wide")
+_RUN_TEST_TIMES = __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "test-times"
 
-st.title("Farmer.CHAT – Side-by-Side Model Comparison")
-st.write("Compare **GPT‑4o‑mini** vs **Fine-Tuned** pipelines for farmer queries.")
+if not _RUN_TEST_TIMES:
+    st.set_page_config(page_title="Farmer.CHAT – Model Comparison", layout="wide")
 
-with st.sidebar:
-    st.header("Settings")
-    st.write("API keys are read from `.env`. Override here if needed.")
+    st.title("Farmer.CHAT – Side-by-Side Model Comparison")
+    st.write("Compare **GPT‑4o‑mini** vs **Fine-Tuned** pipelines for farmer queries.")
 
-    openai_key_override = st.text_input(
-        "OpenAI API Key",
-        value=OPENAI_API_KEY,
-        type="password",
-    )
-    together_key_override = st.text_input(
-        "Together API Key",
-        value=TOGETHER_API_KEY,
-        type="password",
-    )
+    with st.sidebar:
+        st.header("Settings")
+        st.write("API keys are read from `.env`. Override here if needed.")
 
-    if openai_key_override:
-        openai.api_key = openai_key_override
-    if together_key_override:
-        # Override Together client if a key is provided in the sidebar
-        together_client = Together(api_key=together_key_override)
+        openai_key_override = st.text_input(
+            "OpenAI API Key",
+            value=OPENAI_API_KEY,
+            type="password",
+        )
+        together_key_override = st.text_input(
+            "Together API Key",
+            value=TOGETHER_API_KEY,
+            type="password",
+        )
 
-    st.markdown("---")
-    location = st.text_input("Farmer location", value="Bihar")
-    preferred_language = st.text_input("Preferred language", value="Hindi")
-    current_date = st.text_input("Current date", value="2026-02-09")
+        if openai_key_override:
+            openai.api_key = openai_key_override
+        if together_key_override:
+            # Override Together client if a key is provided in the sidebar
+            together_client = Together(api_key=together_key_override)
 
-    # Performance metrics from last run (if available)
-    if "last_perf" in st.session_state:
         st.markdown("---")
-        st.subheader("Performance (last run)")
-        lp = st.session_state["last_perf"]
-        if lp.get("vanilla_time") is not None:
-            st.metric("GPT‑4o‑mini latency (s)", f"{lp['vanilla_time']:.2f}")
-        if lp.get("ft_time") is not None:
-            st.metric("Fine-Tuned latency (s)", f"{lp['ft_time']:.2f}")
-        if lp.get("vanilla_spec_label"):
-            st.metric("GPT‑4o‑mini specificity", lp["vanilla_spec_label"])
-        if lp.get("ft_spec_label"):
-            st.metric("Fine-Tuned specificity", lp["ft_spec_label"])
+        location = st.text_input("Farmer location", value="Bihar")
+        preferred_language = st.text_input("Preferred language", value="Hindi")
+        current_date = st.text_input("Current date", value="2026-02-09")
 
-default_question = "धान की फसल में कीट नियंत्रण कैसे करें?"
-user_question = st.text_area(
-    "Farmer query (same sent to both models)",
-    value=default_question,
-    height=140,
-)
-
-col1, col2 = st.columns(2)
-
-if st.button("Run comparison"):
-    if not openai.api_key:
-        st.error("OpenAI API key is missing. Set it in `.env` or the sidebar.")
-    elif not together_client:
-        st.error("Together API key is missing. Set it in `.env` or the sidebar.")
-    elif not user_question.strip():
-        st.error("Please enter a farmer query.")
-    else:
-        vanilla_result = {"text": None, "error": None}
-        ft_result = {"text": None, "facts": None, "error": None}
-        perf = {"vanilla_time": None, "ft_time": None}
-
-        def run_vanilla_thread():
-            try:
-                t0 = time.time()
-                text = run_vanilla_model(
-                    user_question, location, preferred_language, current_date
-                )
-                perf["vanilla_time"] = time.time() - t0
-                vanilla_result["text"] = text
-            except Exception as e:
-                vanilla_result["error"] = str(e)
-
-        def run_ft_thread():
-            try:
-                t0 = time.time()
-                resp, facts = run_ft_stitched_pipeline(user_question)
-                perf["ft_time"] = time.time() - t0
-                ft_result["text"] = resp
-                ft_result["facts"] = facts
-            except Exception as e:
-                ft_result["error"] = str(e)
-
-        with st.spinner("Running both models (generation only)..."):
-            t1 = threading.Thread(target=run_vanilla_thread)
-            t2 = threading.Thread(target=run_ft_thread)
-            t1.start()
-            t2.start()
-            t1.join()
-            t2.join()
-
-        # Store performance metrics for sidebar display
-        if perf["vanilla_time"] is not None or perf["ft_time"] is not None:
-            st.session_state["last_perf"] = perf
-
-        # Show raw answers immediately
-        with col1:
-            st.subheader("GPT‑4o‑mini")
-            if vanilla_result["error"]:
-                st.error(f"Error: {vanilla_result['error']}")
-            else:
-                st.markdown(vanilla_result["text"])
-
-        with col2:
-            st.subheader("Fine-Tuned")
-            if ft_result["error"]:
-                st.error(f"Error: {ft_result['error']}")
-            else:
-                st.markdown(ft_result["text"])
-                if ft_result["facts"]:
-                    with st.expander("Show extracted facts JSON"):
-                        st.code(ft_result["facts"], language="json")
-
-        # Run comparison + specificity after showing answers
-        if not vanilla_result["error"] and not ft_result["error"]:
-            with st.spinner("Running comparison and specificity evals..."):
-                judge_result = compare_answers(user_question, vanilla_result["text"], ft_result["text"])
-                gpt4o_spec = classify_specificity(vanilla_result["text"])
-                ft_spec = classify_specificity(ft_result["text"])
-
+        # Performance metrics from last run (if available)
+        if "last_perf" in st.session_state:
             st.markdown("---")
-            st.subheader("Model Comparison (Judge View)")
+            st.subheader("Performance (last run)")
+            lp = st.session_state["last_perf"]
+            if lp.get("vanilla_time") is not None:
+                st.metric("GPT‑4o‑mini latency (s)", f"{lp['vanilla_time']:.2f}")
+            if lp.get("ft_time") is not None:
+                st.metric("Fine-Tuned latency (s)", f"{lp['ft_time']:.2f}")
+            if lp.get("vanilla_spec_label"):
+                st.metric("GPT‑4o‑mini specificity", lp["vanilla_spec_label"])
+            if lp.get("ft_spec_label"):
+                st.metric("Fine-Tuned specificity", lp["ft_spec_label"])
 
-            if "error" in judge_result:
-                st.error(f"Judge error: {judge_result['error']}")
-            else:
-                segs = judge_result.get("segments", [])
-                overall = judge_result.get("overall", {})
+    default_question = "धान की फसल में कीट नियंत्रण कैसे करें?"
+    user_question = st.text_area(
+        "Farmer query (same sent to both models)",
+        value=default_question,
+        height=140,
+    )
 
-                # Simple colored list of segment judgments
-                for seg in segs:
-                    winner = seg.get("winner", "neither")
-                    color = "#eeeeee"
-                    if winner == "ft":
-                        color = "#c8e6c9"  # green for Fine-Tuned (preferred)
-                    elif winner == "gpt4o":
-                        color = "#ffcdd2"  # red for vanilla
+    if st.button("Run comparison"):
+        if not openai.api_key:
+            st.error("OpenAI API key is missing. Set it in `.env` or the sidebar.")
+        elif not together_client:
+            st.error("Together API key is missing. Set it in `.env` or the sidebar.")
+        elif not user_question.strip():
+            st.error("Please enter a farmer query.")
+        else:
+            vanilla_result = {"text": None, "error": None}
+            ft_result = {"text": None, "facts": None, "error": None}
+            perf = {"vanilla_time": None, "ft_time": None}
 
-                    st.markdown(
-                        f"<div style='background-color:{color};padding:8px;border-radius:4px;margin-bottom:4px;'>"
-                        f"<b>Aspect:</b> {seg.get('aspect','')}<br>"
-                        f"<b>Winner:</b> {winner}<br>"
-                        f"<b>Reason:</b> {seg.get('reason','')}"
-                        f"</div>",
-                        unsafe_allow_html=True,
+            def run_vanilla_thread():
+                try:
+                    t0 = time.time()
+                    text = run_vanilla_model(
+                        user_question, location, preferred_language, current_date
                     )
+                    perf["vanilla_time"] = time.time() - t0
+                    vanilla_result["text"] = text
+                except Exception as e:
+                    vanilla_result["error"] = str(e)
 
-                # Tabular-style explanation like your example
-                st.markdown("**Overall judgment:**")
-                better = overall.get("better_model", "neither")
-                reason = overall.get("reason", "")
-                better_label = "Fine-Tuned + Fact-Stitching" if better == "ft" else (
-                    "GPT‑4o‑mini" if better == "gpt4o" else "Both / Neither"
-                )
-                st.markdown(f"👉 **Better response:** {better_label}")
-                if reason:
-                    st.markdown(f"**Why?** {reason}")
+            def run_ft_thread():
+                try:
+                    t0 = time.time()
+                    resp, facts = run_ft_stitched_pipeline(user_question)
+                    perf["ft_time"] = time.time() - t0
+                    ft_result["text"] = resp
+                    ft_result["facts"] = facts
+                except Exception as e:
+                    ft_result["error"] = str(e)
 
-            st.markdown("---")
-            st.subheader("Specificity (per answer)")
+            with st.spinner("Running GPT‑4o‑mini and Fine-Tuned Model in parallel..."):
+                t1 = threading.Thread(target=run_vanilla_thread)
+                t2 = threading.Thread(target=run_ft_thread)
+                t1.start()
+                t2.start()
+                t1.join()
+                t2.join()
 
-            col_s1, col_s2 = st.columns(2)
-            with col_s1:
-                st.markdown("**GPT‑4o‑mini**")
-                st.write(f"Label: {gpt4o_spec['label']}")
-                st.write(f"Flags: {', '.join(gpt4o_spec['flags']) or 'None'}")
-                st.write(f"Justification: {gpt4o_spec['justification']}")
+            # Store performance metrics for sidebar display
+            if perf["vanilla_time"] is not None or perf["ft_time"] is not None:
+                st.session_state["last_perf"] = perf
 
-            with col_s2:
-                st.markdown("**Fine-Tuned**")
-                st.write(f"Label: {ft_spec['label']}")
-                st.write(f"Flags: {', '.join(ft_spec['flags']) or 'None'}")
-                st.write(f"Justification: {ft_spec['justification']}")
+            # Show raw answers immediately
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("GPT‑4o‑mini")
+                if vanilla_result["error"]:
+                    st.error(f"Error: {vanilla_result['error']}")
+                else:
+                    st.markdown(vanilla_result["text"])
 
+            with col2:
+                st.subheader("Fine-Tuned")
+                if ft_result["error"]:
+                    st.error(f"Error: {ft_result['error']}")
+                else:
+                    st.markdown(ft_result["text"])
+                    if ft_result["facts"]:
+                        with st.expander("Show extracted facts JSON"):
+                            st.code(ft_result["facts"], language="json")
+
+            # Run comparison + specificity after showing answers
+            if not vanilla_result["error"] and not ft_result["error"]:
+                with st.spinner("Running comparison and specificity evals..."):
+                    judge_result = compare_answers(user_question, vanilla_result["text"], ft_result["text"])
+                    gpt4o_spec = classify_specificity(vanilla_result["text"])
+                    ft_spec = classify_specificity(ft_result["text"])
+                    
+                    # Store specificity in session state for sidebar
+                    st.session_state["last_perf"]["vanilla_spec_label"] = gpt4o_spec.get("label", "N/A")
+                    st.session_state["last_perf"]["ft_spec_label"] = ft_spec.get("label", "N/A")
+
+                st.markdown("---")
+                st.subheader("Model Comparison (Judge View)")
+
+                if "error" in judge_result:
+                    st.error(f"Judge error: {judge_result['error']}")
+                else:
+                    segs = judge_result.get("segments", [])
+                    overall = judge_result.get("overall", {})
+
+                    # Table: Aspect | Winner | Reason (display labels: ft → Finetuned, gpt4o → GPT-4o-mini)
+                    WINNER_LABELS = {"ft": "Finetuned", "gpt4o": "GPT-4o-mini", "both": "Both", "neither": "Neither"}
+                    table_data = [
+                        [
+                            seg.get("aspect", ""),
+                            WINNER_LABELS.get(seg.get("winner", ""), seg.get("winner", "")),
+                            seg.get("reason", ""),
+                        ]
+                        for seg in segs
+                    ]
+                    if table_data:
+                        st.table(pd.DataFrame(table_data, columns=["Aspect", "Winner", "Reason"]))
+
+                    # Overall judgment
+                    st.markdown("**Overall judgment:**")
+                    better = overall.get("better_model", "neither").lower().strip()
+                    reason = overall.get("reason", "")
+                    
+                    # Map judge output to display labels
+                    if better == "ft":
+                        better_label = "Fine-Tuned"
+                    elif better == "gpt4o":
+                        better_label = "GPT‑4o‑mini"
+                    elif better == "both":
+                        better_label = "Both"
+                    elif better == "neither":
+                        better_label = "Neither"
+                    else:
+                        better_label = better.capitalize()  # fallback for unexpected values
+                    
+                    st.markdown(f"👉 **Better response:** {better_label}")
+                    if reason:
+                        st.markdown(f"**Why?** {reason}")
+
+                st.markdown("---")
+                st.subheader("Specificity Evaluation")
+
+                col_s1, col_s2 = st.columns(2)
+                with col_s1:
+                    st.markdown("**GPT‑4o‑mini**")
+                    st.write(f"Label: {gpt4o_spec['label']}")
+                    st.write(f"Flags: {', '.join(gpt4o_spec['flags']) or 'None'}")
+                    st.write(f"Justification: {gpt4o_spec['justification']}")
+
+                with col_s2:
+                    st.markdown("**Fine-Tuned**")
+                    st.write(f"Label: {ft_spec['label']}")
+                    st.write(f"Flags: {', '.join(ft_spec['flags']) or 'None'}")
+                    st.write(f"Justification: {ft_spec['justification']}")
+
+
+# ============================================================================
+# TERMINAL: test-times (python app.py test-times)
+# ============================================================================
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "test-times":
+    question = "धान की फसल में कीट नियंत्रण कैसे करें?"
+    location, preferred_language, current_date = "Bihar", "Hindi", "2026-02-09"
+    
+    print("=" * 80)
+    print("Test times: Vanilla GPT-4o-mini vs Fact+Stitching (FT → Gemma)")
+    print("=" * 80)
+    
+    results = {"vanilla_time": None, "ft_time": None}
+    
+    def vanilla_thread():
+        t0 = time.time()
+        try:
+            run_vanilla_model(question, location, preferred_language, current_date)
+            results["vanilla_time"] = time.time() - t0
+        except Exception as e:
+            print(f"Vanilla error: {e}")
+    
+    def ft_thread():
+        t0 = time.time()
+        try:
+            run_ft_stitched_pipeline(question)
+            results["ft_time"] = time.time() - t0
+        except Exception as e:
+            print(f"FT error: {e}")
+    
+    print("\nRunning BOTH pipelines in parallel...\n")
+    wall_clock_start = time.time()
+    
+    t1 = threading.Thread(target=vanilla_thread)
+    t2 = threading.Thread(target=ft_thread)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    
+    wall_clock_total = time.time() - wall_clock_start
+    
+    print("=" * 80)
+    print("RESULTS (parallel execution)")
+    print("=" * 80)
+    if results["vanilla_time"]:
+        print(f"  Vanilla GPT-4o-mini: {results['vanilla_time']:.2f} s")
+    if results["ft_time"]:
+        print(f"  Fact+Stitching (FT → Gemma): {results['ft_time']:.2f} s")
+    print(f"\n  Total wall-clock time: {wall_clock_total:.2f} s")
+    print(f"  Expected: ~max({results['vanilla_time']:.2f}, {results['ft_time']:.2f}) = ~{max(results['vanilla_time'] or 0, results['ft_time'] or 0):.2f} s")
+    print("=" * 80)
