@@ -1,11 +1,15 @@
 import os
 import time
 import threading
+import json
 
 import streamlit as st
 import openai
 from together import Together
 from dotenv import load_dotenv
+import pandas as pd
+
+from evals import run_enhanced_evaluation_pipeline_optimized
 
 
 # ============================================================================
@@ -28,6 +32,18 @@ SYNTHESIS_MODEL = "google/gemma-3n-E4B-it"
 
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
+
+
+# ============================================================================
+# SIMPLE LANGUAGE DETECTION
+# ============================================================================
+
+def detect_language_name(text: str) -> str:
+    """Very simple language heuristic: Hindi (Devanagari) vs English/other."""
+    for ch in text:
+        if "\u0900" <= ch <= "\u097F":
+            return "Hindi"
+    return "English"
 
 
 # ============================================================================
@@ -95,6 +111,78 @@ Overly technical jargon without explanation
 Repetitive closing statements or tips
 Specific product recommendations without local context
 Assumptions about farmer's resources or experience level
+"""
+
+
+NEW_SPECIFICITY_PROMPT = """
+You are an agricultural fact classifier. Your task is to classify answers as either "Specific" or "Not Specific" based on their contextual anchors and actionability.
+
+Use this framework internally:
+- Specific: Contains sufficient contextual anchors AND actionable insight
+- Not Specific: Lacks contextual anchors OR actionable insight; generic or vague
+
+Checklist (for your own reasoning, do NOT list these back):
+1. Entity specificity (crop/variety/soil/weather/organization named)
+2. Location specificity (named place or bounded geography)
+3. Time specificity (explicit time window or marker, including seasons like Rabi/Kharif/Zaid, 30 DAS, pre-sowing)
+4. Quantity/measurement (numeric or measurable details)
+5. Conditionality/comparison (if-then, comparative baselines)
+6. Mechanistic/causal link (clear cause-effect enabling decision-making)
+7. Actionability (directly informs a decision or step relevant to context)
+
+Decision rule:
+- Specific = at least 2 of flags 1–6 are TRUE AND flag 7 is TRUE
+- Not Specific = otherwise
+
+OUTPUT FORMAT (STRICT):
+Return a SINGLE LINE in this exact pipe-delimited format, no extra text:
+LABEL|flag1,flag2,...|brief justification
+
+Where:
+- LABEL is exactly "Specific" or "Not Specific"
+- flags is a comma-separated list of lowercase snake_case flag names you consider true (e.g. entity_specificity,time_specificity,actionability). Use empty string if none.
+- justification is a short explanation referencing anchors and actionability (no newlines; use ';' if needed).
+"""
+
+
+COMPARISON_PROMPT = """
+You are an expert agricultural assistant and model evaluator. You will compare TWO answers given to the SAME farmer question:
+- "gpt4o" = vanilla GPT‑4o‑mini answer
+- "ft" = Fine-Tuned + Fact-Stitching answer
+
+Your main goal is to highlight where the Fine-Tuned pipeline is **better** along practically useful dimensions, especially:
+- Actionability (clear steps for farmers)
+- Quantity / dosage precision
+- Timing (when to do what)
+- Local context (Bihar, smallholder-friendly)
+- Safety (correct, non-harmful, cautious)
+
+Your job:
+1. Mentally break the content into aspects (1–3 sentences or a coherent bullet).
+2. For each aspect, decide which answer serves the farmer better:
+   - "gpt4o" (GPT‑4o‑mini better)
+   - "ft" (Fine-Tuned better)  ← if both are good but ft is slightly better, pick "ft"
+   - "both" (equally good and similar)
+   - "neither" (both are poor or irrelevant)
+3. Give a short reason for each aspect-level judgment, focusing on:
+   - factual correctness and recall
+   - specificity and actionability
+   - clarity and safety for farmers in Bihar
+
+Then also provide an overall comparison summary with a clear "Better response" choice.
+
+STRICT OUTPUT FORMAT (NO JSON, NO EXTRA TEXT):
+Return multiple lines in this format:
+
+SEG|aspect_name|winner|short_reason
+...
+OVERALL|better_model|short_reason
+
+Where:
+- aspect_name is a short name like "actionability", "dosage precision", "timing", "local context", "safety", etc. (no pipes, no newlines)
+- winner is exactly one of: gpt4o, ft, both, neither
+- short_reason is a one-line explanation (no newlines, avoid '|' character; use ';' if needed)
+- better_model is exactly one of: gpt4o, ft, both, neither
 """
 
 
@@ -301,6 +389,8 @@ def run_vanilla_model(question: str, location: str, preferred_language: str, cur
 
 def run_ft_stitched_pipeline(question: str, retry_count: int = 0):
     try:
+        user_lang = detect_language_name(question)
+
         fact_response = openai.ChatCompletion.create(
             model=FINE_TUNED_MODEL,
             messages=[
@@ -313,6 +403,9 @@ def run_ft_stitched_pipeline(question: str, retry_count: int = 0):
         facts_json_str = fact_response["choices"][0]["message"]["content"]
 
         synthesis_user_prompt = f"""
+USER QUERY LANGUAGE: {user_lang}
+Preferred Language: {user_lang}
+
 **FARMER QUERY:** {question}
 
 **STRUCTURED FACTS:**
@@ -321,7 +414,7 @@ def run_ft_stitched_pipeline(question: str, retry_count: int = 0):
 **TASK:** Synthesize these facts into a natural, conversational response that directly answers the farmer's question while maintaining all technical accuracy and actionable details.
 
 **IMPORTANT:**
-1. Respond in the SAME LANGUAGE as the farmer's query above
+1. Respond STRICTLY in {user_lang}. Do NOT mix in other languages except technical names.
 2. Use bullet points (•) for lists and recommendations
 3. Use numbered lists (1., 2., 3.) for sequential steps
 4. Keep formatting clear and easy to read
@@ -351,6 +444,120 @@ def run_ft_stitched_pipeline(question: str, retry_count: int = 0):
         raise
 
 
+def classify_specificity(text: str):
+    """Classify a response as Specific / Not Specific using NEW_SPECIFICITY_PROMPT.
+
+    Returns a small dict with label, flags, justification.
+    """
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": NEW_SPECIFICITY_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.0,
+            max_tokens=400,
+        )
+        content = resp["choices"][0]["message"]["content"].strip()
+        # Remove code fences if present
+        if content.startswith("```"):
+            content = content.strip("`").strip()
+
+        # Expected format: LABEL|flag1,flag2|justification
+        parts = content.split("|", 2)
+        if len(parts) != 3:
+            raise ValueError(f"Unexpected specificity format: {content}")
+
+        label = parts[0].strip()
+        flags_str = parts[1].strip()
+        justification = parts[2].strip()
+
+        flags = [f.strip() for f in flags_str.split(",") if f.strip()] if flags_str else []
+        return {
+            "label": label,
+            "flags": flags,
+            "justification": justification,
+        }
+    except Exception as e:
+        return {
+            "label": "Error",
+            "flags": [],
+            "justification": f"Specificity evaluation failed: {e}",
+        }
+
+
+def compare_answers(question: str, gpt4o_text: str, ft_text: str):
+    """Use GPT‑4o as a judge to compare answers segment-wise.
+
+    Returns a dict with:
+      - 'segments': list of {aspect, winner, reason}
+      - 'overall': {better_model, reason}
+      - or {'error': ...} on failure.
+    """
+    try:
+        judge_prompt = f"""
+FARMER QUESTION:
+{question}
+
+GPT‑4o‑mini ANSWER:
+{gpt4o_text}
+
+FINE-TUNED ANSWER:
+{ft_text}
+
+Follow the instructions and JSON schema exactly.
+"""
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": COMPARISON_PROMPT},
+                {"role": "user", "content": judge_prompt},
+            ],
+            temperature=0.0,
+            max_tokens=800,
+        )
+        content = resp["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.strip("`").strip()
+
+        segments = []
+        overall = {"better_model": "neither", "reason": ""}
+
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("SEG|"):
+                parts = line.split("|", 3)
+                if len(parts) < 4:
+                    continue
+                _, aspect, winner, reason = parts
+                segments.append(
+                    {
+                        "aspect": aspect.strip(),
+                        "winner": winner.strip(),
+                        "reason": reason.strip(),
+                    }
+                )
+            elif line.startswith("OVERALL|"):
+                parts = line.split("|", 2)
+                if len(parts) < 3:
+                    continue
+                _, better_model, reason = parts
+                overall = {
+                    "better_model": better_model.strip(),
+                    "reason": reason.strip(),
+                }
+
+        if not segments and not overall.get("reason"):
+            raise ValueError(f"Unexpected judge format: {content}")
+
+        return {"segments": segments, "overall": overall}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ============================================================================
 # STREAMLIT UI
 # ============================================================================
@@ -358,7 +565,7 @@ def run_ft_stitched_pipeline(question: str, retry_count: int = 0):
 st.set_page_config(page_title="Farmer.CHAT – Model Comparison", layout="wide")
 
 st.title("Farmer.CHAT – Side-by-Side Model Comparison")
-st.write("Compare **vanilla GPT‑4o‑mini** vs **Fine‑tuned + Fact‑Stitching** for farmer queries.")
+st.write("Compare **GPT‑4o‑mini** vs **Fine-Tuned** pipelines for farmer queries.")
 
 with st.sidebar:
     st.header("Settings")
@@ -386,6 +593,20 @@ with st.sidebar:
     preferred_language = st.text_input("Preferred language", value="Hindi")
     current_date = st.text_input("Current date", value="2026-02-09")
 
+    # Performance metrics from last run (if available)
+    if "last_perf" in st.session_state:
+        st.markdown("---")
+        st.subheader("Performance (last run)")
+        lp = st.session_state["last_perf"]
+        if lp.get("vanilla_time") is not None:
+            st.metric("GPT‑4o‑mini latency (s)", f"{lp['vanilla_time']:.2f}")
+        if lp.get("ft_time") is not None:
+            st.metric("Fine-Tuned latency (s)", f"{lp['ft_time']:.2f}")
+        if lp.get("vanilla_spec_label"):
+            st.metric("GPT‑4o‑mini specificity", lp["vanilla_spec_label"])
+        if lp.get("ft_spec_label"):
+            st.metric("Fine-Tuned specificity", lp["ft_spec_label"])
+
 default_question = "धान की फसल में कीट नियंत्रण कैसे करें?"
 user_question = st.text_area(
     "Farmer query (same sent to both models)",
@@ -405,24 +626,30 @@ if st.button("Run comparison"):
     else:
         vanilla_result = {"text": None, "error": None}
         ft_result = {"text": None, "facts": None, "error": None}
+        perf = {"vanilla_time": None, "ft_time": None}
 
         def run_vanilla_thread():
             try:
-                vanilla_result["text"] = run_vanilla_model(
+                t0 = time.time()
+                text = run_vanilla_model(
                     user_question, location, preferred_language, current_date
                 )
+                perf["vanilla_time"] = time.time() - t0
+                vanilla_result["text"] = text
             except Exception as e:
                 vanilla_result["error"] = str(e)
 
         def run_ft_thread():
             try:
+                t0 = time.time()
                 resp, facts = run_ft_stitched_pipeline(user_question)
+                perf["ft_time"] = time.time() - t0
                 ft_result["text"] = resp
                 ft_result["facts"] = facts
             except Exception as e:
                 ft_result["error"] = str(e)
 
-        with st.spinner("Running both models..."):
+        with st.spinner("Running both models (generation only)..."):
             t1 = threading.Thread(target=run_vanilla_thread)
             t2 = threading.Thread(target=run_ft_thread)
             t1.start()
@@ -430,15 +657,20 @@ if st.button("Run comparison"):
             t1.join()
             t2.join()
 
+        # Store performance metrics for sidebar display
+        if perf["vanilla_time"] is not None or perf["ft_time"] is not None:
+            st.session_state["last_perf"] = perf
+
+        # Show raw answers immediately
         with col1:
-            st.subheader("Vanilla GPT‑4o‑mini")
+            st.subheader("GPT‑4o‑mini")
             if vanilla_result["error"]:
                 st.error(f"Error: {vanilla_result['error']}")
             else:
                 st.markdown(vanilla_result["text"])
 
         with col2:
-            st.subheader("Fine‑tuned + Fact‑Stitching")
+            st.subheader("Fine-Tuned")
             if ft_result["error"]:
                 st.error(f"Error: {ft_result['error']}")
             else:
@@ -446,4 +678,65 @@ if st.button("Run comparison"):
                 if ft_result["facts"]:
                     with st.expander("Show extracted facts JSON"):
                         st.code(ft_result["facts"], language="json")
+
+        # Run comparison + specificity after showing answers
+        if not vanilla_result["error"] and not ft_result["error"]:
+            with st.spinner("Running comparison and specificity evals..."):
+                judge_result = compare_answers(user_question, vanilla_result["text"], ft_result["text"])
+                gpt4o_spec = classify_specificity(vanilla_result["text"])
+                ft_spec = classify_specificity(ft_result["text"])
+
+            st.markdown("---")
+            st.subheader("Model Comparison (Judge View)")
+
+            if "error" in judge_result:
+                st.error(f"Judge error: {judge_result['error']}")
+            else:
+                segs = judge_result.get("segments", [])
+                overall = judge_result.get("overall", {})
+
+                # Simple colored list of segment judgments
+                for seg in segs:
+                    winner = seg.get("winner", "neither")
+                    color = "#eeeeee"
+                    if winner == "ft":
+                        color = "#c8e6c9"  # green for Fine-Tuned (preferred)
+                    elif winner == "gpt4o":
+                        color = "#ffcdd2"  # red for vanilla
+
+                    st.markdown(
+                        f"<div style='background-color:{color};padding:8px;border-radius:4px;margin-bottom:4px;'>"
+                        f"<b>Aspect:</b> {seg.get('aspect','')}<br>"
+                        f"<b>Winner:</b> {winner}<br>"
+                        f"<b>Reason:</b> {seg.get('reason','')}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # Tabular-style explanation like your example
+                st.markdown("**Overall judgment:**")
+                better = overall.get("better_model", "neither")
+                reason = overall.get("reason", "")
+                better_label = "Fine-Tuned + Fact-Stitching" if better == "ft" else (
+                    "GPT‑4o‑mini" if better == "gpt4o" else "Both / Neither"
+                )
+                st.markdown(f"👉 **Better response:** {better_label}")
+                if reason:
+                    st.markdown(f"**Why?** {reason}")
+
+            st.markdown("---")
+            st.subheader("Specificity (per answer)")
+
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                st.markdown("**GPT‑4o‑mini**")
+                st.write(f"Label: {gpt4o_spec['label']}")
+                st.write(f"Flags: {', '.join(gpt4o_spec['flags']) or 'None'}")
+                st.write(f"Justification: {gpt4o_spec['justification']}")
+
+            with col_s2:
+                st.markdown("**Fine-Tuned**")
+                st.write(f"Label: {ft_spec['label']}")
+                st.write(f"Flags: {', '.join(ft_spec['flags']) or 'None'}")
+                st.write(f"Justification: {ft_spec['justification']}")
 

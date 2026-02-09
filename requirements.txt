@@ -4,3 +4,4 @@ together
 tqdm
 pandas
 python-dotenv
+numpy
