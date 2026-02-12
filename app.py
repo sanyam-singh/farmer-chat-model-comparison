@@ -106,7 +106,20 @@ Culturally appropriate communication style for the region
   - Offer to elaborate on specific aspects if helpful
 
 **RESPONSE FORMAT:**
-Provide your complete response as a natural conversation in {preferred_language}. Structure your advice logically but don't force artificial formatting.
+Provide your complete response as a natural conversation in {preferred_language}. Use proper markdown formatting:
+
+**Markdown Guidelines:**
+- Use **bold** for emphasis on key terms and important warnings
+- Use bullet points (•) or dashes (-) for lists of items, recommendations, or options
+- Use numbered lists (1., 2., 3.) for sequential steps or procedures
+- Use line breaks between different topics or sections for readability
+- Use ### for section headings if organizing multiple topics
+- Keep paragraphs short (2-3 sentences max)
+
+**Structure:**
+- Start with a brief direct answer to the farmer's question
+- Follow with organized, well-formatted details using bullets or numbers
+- End with practical next steps or reminders if relevant
 
 **AVOID:**
 Generic advice that could apply to any crop/region
@@ -306,16 +319,18 @@ You are Farmer.CHAT, a knowledgeable agricultural advisor helping farmers in Bih
 
 
 **FORMATTING REQUIREMENTS:**
-- Use bullet points (•) for lists of steps, recommendations, or multiple items
+Use proper markdown formatting for readability:
+- Use **bold** for emphasis on key terms and important warnings
+- Use bullet points (•) or dashes (-) for lists of items, recommendations, or options
 - Use numbered lists (1., 2., 3.) for sequential steps or procedures
+- Use ### for section headings when organizing multiple topics
 - Keep paragraphs short (2-3 sentences max)
-- Use line breaks between different topics or sections
-- Bold key terms or important warnings when needed
-- Structure complex advice with clear headings or separators
+- Use line breaks between different topics or sections for better readability
+- Ensure proper spacing around headings, lists, and paragraphs
 
 
 **RESPONSE FORMAT:**
-Provide your complete response as a natural conversation with proper formatting. Structure your advice logically with bullet points and numbered lists where appropriate. Keep responses between 150-300 words.
+Provide your complete response as a natural, well-formatted conversation using markdown. Structure your advice with clear sections, bullet points, and numbered lists where appropriate. Keep responses between 150-300 words.
 
 
 **AVOID:**
@@ -568,6 +583,87 @@ Follow the instructions and JSON schema exactly.
         return {"error": str(e)}
 
 
+def identify_unique_highlights(vanilla_text: str, ft_text: str):
+    """Identify unique/enhanced points in Fine-Tuned response compared to Vanilla.
+    
+    Returns a dict with 'unique_points': list of brief descriptions
+    """
+    highlight_prompt = f"""You are an expert agricultural advisor evaluator. Compare two responses to identify what makes the Fine-Tuned response unique or better.
+
+**VANILLA RESPONSE:**
+{vanilla_text}
+
+**FINE-TUNED RESPONSE:**
+{ft_text}
+
+**TASK:**
+Identify specific points, details, or advice in the Fine-Tuned response that are either:
+1. Completely NEW (not mentioned at all in Vanilla)
+2. ENHANCED (mentioned but with significantly more detail, precision, or actionability)
+
+For each unique point, also extract the EXACT phrase or sentence from the Fine-Tuned response.
+
+**OUTPUT FORMAT:**
+For each unique/enhanced point, output ONE line in this format:
+POINT|brief description|exact text from response (keep it short, max 80 chars)
+
+Examples:
+POINT|Specific neem oil dosage provided|नीम के तेल को प्रति लीटर पानी में मिलाकर
+POINT|Weekly application frequency|सप्ताह में एक बार छिड़काव कर सकते हैं
+POINT|Safety precautions mentioned|सुरक्षा सावधानी बर्तें, जैसे दस्ताने और मास्क
+
+Output ONLY the POINT lines, no other text. If there are no significant differences, output:
+NONE|No significant unique points found|
+"""
+    
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an expert agricultural response comparison specialist."},
+                {"role": "user", "content": highlight_prompt}
+            ],
+            temperature=0.0,
+            max_tokens=800,
+        )
+        content = resp["choices"][0]["message"]["content"].strip()
+        
+        # Parse lines
+        unique_points = []
+        highlight_phrases = []
+        for line in content.split("\n"):
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            parts = line.split("|")
+            if len(parts) >= 3 and parts[0].strip() == "POINT":
+                unique_points.append(parts[1].strip())
+                highlight_phrases.append(parts[2].strip())
+        
+        return {
+            "unique_points": unique_points,
+            "highlight_phrases": highlight_phrases
+        }
+    except Exception as e:
+        return {"unique_points": [], "highlight_phrases": [], "error": str(e)}
+
+
+def highlight_text_segments(text: str, phrases: list) -> str:
+    """Highlight specified phrases in the text with green background."""
+    highlighted_text = text
+    
+    # Sort phrases by length (longest first) to avoid partial matches
+    sorted_phrases = sorted(phrases, key=len, reverse=True)
+    
+    for phrase in sorted_phrases:
+        if phrase and phrase in highlighted_text:
+            # Wrap the phrase in HTML with green highlight
+            highlighted_phrase = f'<span style="background-color: #d4edda; color: #155724; padding: 2px 4px; border-radius: 3px; font-weight: 600;">{phrase}</span>'
+            highlighted_text = highlighted_text.replace(phrase, highlighted_phrase)
+    
+    return highlighted_text
+
+
 # ============================================================================
 # STREAMLIT UI (skip when running: python app.py test-times)
 # ============================================================================
@@ -576,6 +672,32 @@ _RUN_TEST_TIMES = __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] =
 
 if not _RUN_TEST_TIMES:
     st.set_page_config(page_title="Farmer.CHAT – Model Comparison", layout="wide")
+
+    # Custom CSS to reduce font size in response columns
+    st.markdown("""
+    <style>
+    /* Reduce font size for response content */
+    .stMarkdown p, .stMarkdown li, .stMarkdown span {
+        font-size: 14px !important;
+    }
+    .stMarkdown h1 {
+        font-size: 20px !important;
+    }
+    .stMarkdown h2 {
+        font-size: 18px !important;
+    }
+    .stMarkdown h3 {
+        font-size: 16px !important;
+    }
+    .stMarkdown h4 {
+        font-size: 15px !important;
+    }
+    /* Keep highlighted segments readable */
+    .stMarkdown span[style*="background-color"] {
+        font-size: 14px !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
     st.title("Farmer.CHAT – Side-by-Side Model Comparison")
     st.write("Compare **GPT‑4o‑mini** vs **Fine-Tuned** pipelines for farmer queries.")
@@ -680,28 +802,100 @@ if not _RUN_TEST_TIMES:
                 if vanilla_result["error"]:
                     st.error(f"Error: {vanilla_result['error']}")
                 else:
-                    st.markdown(vanilla_result["text"])
+                    vanilla_display = st.empty()
+                    vanilla_display.markdown(vanilla_result["text"])
 
             with col2:
                 st.subheader("Fine-Tuned")
                 if ft_result["error"]:
                     st.error(f"Error: {ft_result['error']}")
                 else:
-                    st.markdown(ft_result["text"])
-                    if ft_result["facts"]:
-                        with st.expander("Show extracted facts JSON"):
-                            st.code(ft_result["facts"], language="json")
+                    ft_display = st.empty()
+                    ft_display.markdown(ft_result["text"])
+                    # Placeholder for victory badge - will be updated after eval
+                    victory_placeholder = st.empty()
 
-            # Run comparison + specificity after showing answers
+            # Run comparison + specificity + highlights after showing answers
             if not vanilla_result["error"] and not ft_result["error"]:
-                with st.spinner("Running comparison and specificity evals..."):
-                    judge_result = compare_answers(user_question, vanilla_result["text"], ft_result["text"])
-                    gpt4o_spec = classify_specificity(vanilla_result["text"])
-                    ft_spec = classify_specificity(ft_result["text"])
+                with st.spinner("Running comparison, specificity evals, and highlight analysis..."):
+                    # Run all evaluations in parallel using threads
+                    eval_results = {
+                        "judge": None,
+                        "vanilla_spec": None,
+                        "ft_spec": None,
+                        "highlights": None
+                    }
+                    
+                    def eval_judge():
+                        eval_results["judge"] = compare_answers(user_question, vanilla_result["text"], ft_result["text"])
+                    
+                    def eval_vanilla_spec():
+                        eval_results["vanilla_spec"] = classify_specificity(vanilla_result["text"])
+                    
+                    def eval_ft_spec():
+                        eval_results["ft_spec"] = classify_specificity(ft_result["text"])
+                    
+                    def eval_highlights():
+                        eval_results["highlights"] = identify_unique_highlights(vanilla_result["text"], ft_result["text"])
+                    
+                    # Run all evaluations in parallel
+                    import threading
+                    threads = [
+                        threading.Thread(target=eval_judge),
+                        threading.Thread(target=eval_vanilla_spec),
+                        threading.Thread(target=eval_ft_spec),
+                        threading.Thread(target=eval_highlights)
+                    ]
+                    for t in threads:
+                        t.start()
+                    for t in threads:
+                        t.join()
+                    
+                    judge_result = eval_results["judge"]
+                    gpt4o_spec = eval_results["vanilla_spec"]
+                    ft_spec = eval_results["ft_spec"]
+                    highlights = eval_results["highlights"]
                     
                     # Store specificity in session state for sidebar
                     st.session_state["last_perf"]["vanilla_spec_label"] = gpt4o_spec.get("label", "N/A")
                     st.session_state["last_perf"]["ft_spec_label"] = ft_spec.get("label", "N/A")
+
+                # Determine winner
+                overall = judge_result.get("overall", {}) if judge_result and "error" not in judge_result else {}
+                better = overall.get("better_model", "neither").lower().strip()
+                
+                # Normalize the judge's response (handle "ft", "fine-tuned", "finetuned", etc.)
+                if "fine" in better or better == "ft":
+                    better = "ft"
+                elif "gpt" in better or "4o" in better or "mini" in better:
+                    better = "gpt4o"
+                
+                # Highlight unique segments in Fine-Tuned response
+                if highlights and highlights.get("highlight_phrases"):
+                    highlighted_ft_text = highlight_text_segments(
+                        ft_result["text"], 
+                        highlights["highlight_phrases"]
+                    )
+                    ft_display.markdown(highlighted_ft_text, unsafe_allow_html=True)
+                
+                # Show victory badge and animations based on winner
+                if better == "ft":
+                    with victory_placeholder.container():
+                        st.success("🏆 **Fine-Tuned Model Wins!**")
+                    
+                    # Balloons animation (Note: Streamlit balloons are always full-screen, can't be restricted to one column)
+                    # Using 3 waves for extra celebration
+                    for _ in range(3):
+                        st.balloons()
+                
+                elif better == "gpt4o":
+                    # Just 1 balloon for vanilla win
+                    st.balloons()
+                
+                elif better == "both":
+                    # 2 balloons for tie
+                    st.balloons()
+                    st.balloons()
 
                 st.markdown("---")
                 st.subheader("Model Comparison (Judge View)")
@@ -710,7 +904,6 @@ if not _RUN_TEST_TIMES:
                     st.error(f"Judge error: {judge_result['error']}")
                 else:
                     segs = judge_result.get("segments", [])
-                    overall = judge_result.get("overall", {})
 
                     # Table: Aspect | Winner | Reason (display labels: ft → Finetuned, gpt4o → GPT-4o-mini)
                     WINNER_LABELS = {"ft": "Finetuned", "gpt4o": "GPT-4o-mini", "both": "Both", "neither": "Neither"}
@@ -727,7 +920,6 @@ if not _RUN_TEST_TIMES:
 
                     # Overall judgment
                     st.markdown("**Overall judgment:**")
-                    better = overall.get("better_model", "neither").lower().strip()
                     reason = overall.get("reason", "")
                     
                     # Map judge output to display labels
