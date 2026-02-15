@@ -725,7 +725,10 @@ if not _RUN_TEST_TIMES:
 
         st.markdown("---")
         location = st.text_input("Farmer location", value="Bihar")
-        current_date = st.text_input("Current date", value="2026-02-09")
+        # Automatically set to today's date
+        from datetime import datetime
+        today_date = datetime.now().strftime("%Y-%m-%d")
+        current_date = st.text_input("Current date", value=today_date)
 
         # Performance metrics from last run (if available)
         if "last_perf" in st.session_state:
@@ -960,8 +963,11 @@ if not _RUN_TEST_TIMES:
 # ============================================================================
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "test-times":
+    from datetime import datetime
+    
     question = "धान की फसल में कीट नियंत्रण कैसे करें?"
-    location, current_date = "Bihar", "2026-02-09"
+    location = "Bihar"
+    current_date = datetime.now().strftime("%Y-%m-%d")
     
     print("=" * 80)
     print("Test times: Vanilla GPT-4o-mini vs Fact+Stitching (FT → Gemma)")
