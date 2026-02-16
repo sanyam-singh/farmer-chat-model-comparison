@@ -704,26 +704,7 @@ if not _RUN_TEST_TIMES:
 
     with st.sidebar:
         st.header("Settings")
-        st.write("API keys are read from `.env`. Override here if needed.")
-
-        openai_key_override = st.text_input(
-            "OpenAI API Key",
-            value=OPENAI_API_KEY,
-            type="password",
-        )
-        together_key_override = st.text_input(
-            "Together API Key",
-            value=TOGETHER_API_KEY,
-            type="password",
-        )
-
-        if openai_key_override:
-            openai.api_key = openai_key_override
-        if together_key_override:
-            # Override Together client if a key is provided in the sidebar
-            together_client = Together(api_key=together_key_override)
-
-        st.markdown("---")
+        
         location = st.text_input("Farmer location", value="Bihar")
         # Automatically set to today's date
         from datetime import datetime
